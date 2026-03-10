@@ -423,8 +423,8 @@ def leave_one_out(
     overall_std  = float(results_df["acc"].std(ddof=0))
     print(f"\nOverall LOO: {overall_mean:.4f} ± {overall_std:.4f}")
 
-    results_df.to_csv(os.path.join(output_dir, f"{name}_loo.csv"), index=False)
-    with open(os.path.join(output_dir, f"{name}_loo.json"), "w") as f:
+    results_df.to_csv(os.path.join(output_dir, f"{name}.csv"), index=False)
+    with open(os.path.join(output_dir, f"{name}.json"), "w") as f:
         json.dump({
             "overall_mean": round(overall_mean, 4),
             "overall_std":  round(overall_std, 4),
