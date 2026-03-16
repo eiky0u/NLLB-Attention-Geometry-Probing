@@ -181,6 +181,7 @@ def build_dataset(
     feat_cols = make_column_names(n_layers, n_heads, topk)
     assert X.shape[1] == len(feat_cols), f"Shape mismatch: {X.shape[1]} != {len(feat_cols)}"
 
+    os.makedirs(os.path.dirname(output_csv) or ".", exist_ok=True)
     df = pd.concat([pd.DataFrame(metas), pd.DataFrame(X, columns=feat_cols)], axis=1)
     df.to_csv(output_csv, index=False)
     print(f"Saved {len(df)} rows → {output_csv}")

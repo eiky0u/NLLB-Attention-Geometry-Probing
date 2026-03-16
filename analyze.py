@@ -1,7 +1,7 @@
+import argparse
 import json
 import os
 import re
-from itertools import product
 from typing import Dict, List, Tuple
 
 import matplotlib.pyplot as plt
@@ -106,7 +106,7 @@ def infer_dims(df: pd.DataFrame) -> Tuple[int, int]:
 # Standard analysis
 # ---------------------------------------------------------------------------
 
-def run_analysis(df: pd.DataFrame, output_dir: str, n_splits: int, seeds: List[int], name: str):
+def run_cv(df: pd.DataFrame, output_dir: str, n_splits: int, seeds: List[int], name: str):
     os.makedirs(output_dir, exist_ok=True)
 
     y      = df["y"].to_numpy()
@@ -166,85 +166,6 @@ def run_analysis(df: pd.DataFrame, output_dir: str, n_splits: int, seeds: List[i
     _plot_by_layer(layer_accs, output_dir, name)
     _plot_by_head(head_accs, output_dir, name)
     print(f"\nAll outputs saved to {output_dir}/")
-
-
-# ---------------------------------------------------------------------------
-# Leave-two-out
-# ---------------------------------------------------------------------------
-
-def leave_two_out(
-    df: pd.DataFrame,
-    output_dir: str,
-    name: str,
-    seed: int = 42,
-    lang_col: str = "tgt_lang",
-):
-    """
-    Leave-two-out evaluation: hold out 1 SVO + 1 SOV language at a time.
-    All 11×11 = 121 combinations, full feature set.
-
-    Args:
-        lang_col: column to split by.
-                  'tgt_lang' for mode 1 (eng→other),
-                  'src_lang' for mode 2 (other→eng).
-    """
-    os.makedirs(output_dir, exist_ok=True)
-
-    if lang_col not in df.columns:
-        raise ValueError(f"Column '{lang_col}' not found. Use 'tgt_lang' or 'src_lang'.")
-
-    feat_cols = [c for c in df.columns if c.startswith("eig_")]
-    X_all = df[feat_cols].to_numpy(dtype=np.float32)
-    y_all = df["y"].to_numpy()
-
-    combos = list(product(SVO_LANGS, SOV_LANGS))
-    print(f"\nLeave-two-out: {len(combos)} combinations, lang_col='{lang_col}'")
-
-    records = []
-    for svo_lang, sov_lang in combos:
-        held_out   = {svo_lang, sov_lang}
-        test_mask  = df[lang_col].isin(held_out)
-        train_mask = ~test_mask
-
-        if train_mask.sum() == 0 or test_mask.sum() == 0:
-            print(f"  Skip {svo_lang} + {sov_lang}: empty split")
-            continue
-
-        X_train, y_train = X_all[train_mask], y_all[train_mask]
-        X_test,  y_test  = X_all[test_mask],  y_all[test_mask]
-
-        scaler = StandardScaler().fit(X_train)
-        clf    = LogisticRegression(max_iter=1000, random_state=seed)
-        clf.fit(scaler.transform(X_train), y_train)
-        acc = float(accuracy_score(y_test, clf.predict(scaler.transform(X_test))))
-
-        print(f"  SVO={svo_lang.split('_')[0]:4s} SOV={sov_lang.split('_')[0]:4s}: "
-              f"acc={acc:.4f}")
-
-        records.append({
-            "held_svo": svo_lang,
-            "held_sov": sov_lang,
-            "acc":      round(acc, 4),
-            "n_train":  int(train_mask.sum()),
-            "n_test":   int(test_mask.sum()),
-        })
-
-    results_df   = pd.DataFrame(records)
-    overall_mean = float(results_df["acc"].mean())
-    overall_std  = float(results_df["acc"].std(ddof=0))
-    print(f"\nOverall LTO: {overall_mean:.4f} ± {overall_std:.4f}")
-
-    results_df.to_csv(os.path.join(output_dir, f"{name}_lto.csv"), index=False)
-    with open(os.path.join(output_dir, f"{name}_lto.json"), "w") as f:
-        json.dump({
-            "overall_mean": round(overall_mean, 4),
-            "overall_std":  round(overall_std, 4),
-            "per_combo":    records,
-        }, f, indent=2)
-
-    _plot_lto(results_df, output_dir, name, overall_mean, overall_std)
-    print(f"Saved LTO results to {output_dir}/")
-    return results_df
 
 
 # ---------------------------------------------------------------------------
@@ -320,43 +241,6 @@ def _plot_by_head(head_accs: List[Tuple[float, float]], output_dir: str, name: s
     plt.close()
 
 
-def _plot_lto(
-    results_df: pd.DataFrame,
-    output_dir: str,
-    name: str,
-    overall_mean: float,
-    overall_std: float,
-):
-    grid = np.full((len(SVO_LANGS), len(SOV_LANGS)), np.nan)
-    for _, row in results_df.iterrows():
-        i = SVO_LANGS.index(row["held_svo"])
-        j = SOV_LANGS.index(row["held_sov"])
-        grid[i, j] = row["acc"]
-
-    fig, ax = plt.subplots(figsize=(9, 7))
-    im = ax.imshow(grid, aspect="auto", cmap="viridis", vmin=0.5, vmax=1.0)
-    plt.colorbar(im, ax=ax, label="Accuracy")
-    ax.set_xticks(range(len(SOV_LANGS)))
-    ax.set_yticks(range(len(SVO_LANGS)))
-    ax.set_xticklabels([l.split("_")[0] for l in SOV_LANGS], fontsize=9)
-    ax.set_yticklabels([l.split("_")[0] for l in SVO_LANGS], fontsize=9)
-    ax.set_xlabel("Held-out SOV language", fontsize=11)
-    ax.set_ylabel("Held-out SVO language", fontsize=11)
-    ax.set_title(
-        f"Leave-two-out accuracy (mean={overall_mean:.3f} ± {overall_std:.3f})",
-        fontsize=12,
-    )
-    for i in range(len(SVO_LANGS)):
-        for j in range(len(SOV_LANGS)):
-            v = grid[i, j]
-            if not np.isnan(v):
-                ax.text(j, i, f"{v:.2f}", ha="center", va="center",
-                        fontsize=8, color="white" if v < 0.8 else "black")
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, f"{name}_lto.png"), dpi=150)
-    plt.close()
-
-
 # ---------------------------------------------------------------------------
 # Leave-one-out
 # ---------------------------------------------------------------------------
@@ -368,20 +252,8 @@ def leave_one_out(
     seed: int = 42,
     lang_col: str = "tgt_lang",
 ):
-    """
-    Leave-one-language-out evaluation: hold out one language at a time.
-    Trains on all other languages, tests on the held-out language.
-    Accuracy = recall for that language's word order class.
-
-    Args:
-        lang_col: column to split by.
-                  'tgt_lang' for mode 1 (eng→other),
-                  'src_lang' for mode 2 (other→eng).
-    """
     os.makedirs(output_dir, exist_ok=True)
-
-    if lang_col not in df.columns:
-        raise ValueError(f"Column '{lang_col}' not found. Use 'tgt_lang' or 'src_lang'.")
+    name += "loo"
 
     feat_cols = [c for c in df.columns if c.startswith("eig_")]
     X_all = df[feat_cols].to_numpy(dtype=np.float32)
@@ -431,49 +303,47 @@ def leave_one_out(
             "per_lang":     records,
         }, f, indent=2)
 
-    _plot_loo(results_df, output_dir, name, overall_mean, overall_std)
     print(f"Saved LOO results to {output_dir}/")
     return results_df
 
 
-def _plot_loo(
-    results_df: pd.DataFrame,
-    output_dir: str,
-    name: str,
-    overall_mean: float,
-    overall_std: float,
-):
-    fig, ax = plt.subplots(figsize=(12, 5))
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
 
-    colors = ["#2c7bb6" if wo == "SVO" else "#d7191c" for wo in results_df["word_order"]]
-    langs  = [l.split("_")[0] for l in results_df["lang"]]
-
-    bars = ax.bar(langs, results_df["acc"], color=colors, edgecolor="white", linewidth=0.5)
-    ax.axhline(0.5,  linestyle="--", color="gray",  linewidth=1, label="Chance")
-    ax.axhline(overall_mean, linestyle="--", color="black", linewidth=1,
-               label=f"Mean={overall_mean:.3f}")
-
-    # Legend for word order
-    from matplotlib.patches import Patch
-    legend_elements = [
-        Patch(facecolor="#2c7bb6", label="SVO"),
-        Patch(facecolor="#d7191c", label="SOV"),
-    ]
-    ax.legend(handles=legend_elements + [
-        plt.Line2D([0], [0], color="gray",  linestyle="--", label="Chance"),
-        plt.Line2D([0], [0], color="black", linestyle="--", label=f"Mean={overall_mean:.3f}"),
-    ])
-
-    ax.set_xlabel("Language", fontsize=12)
-    ax.set_ylabel("Accuracy", fontsize=12)
-    ax.set_title(
-        f"Leave-one-out accuracy (mean={overall_mean:.3f} ± {overall_std:.3f})",
-        fontsize=13,
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="Run probing analysis on eigenvalue features."
     )
-    ax.set_ylim(0.0, 1.05)
-    ax.set_xticks(range(len(langs)))
-    ax.set_xticklabels(langs, rotation=45, ha="right", fontsize=9)
-    ax.grid(axis="y", alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, f"{name}_loo.png"), dpi=150)
-    plt.close()
+    p.add_argument("--input",      required=True,
+                   help="Path to CSV produced by build_dataset.py")
+    p.add_argument("--output_dir", required=True,
+                   help="Directory for results and plots")
+    p.add_argument("--name",       required=True,
+                   help="Prefix for output files (e.g. mode1_600M)")
+    p.add_argument("--mode",       type=int, default=1, choices=[1, 2],
+                   help="1 = eng→X (lang_col=tgt_lang), 2 = X→eng (lang_col=src_lang)")
+    p.add_argument("--n_splits",   type=int, default=5)
+    p.add_argument("--seeds",      type=int, nargs="+", default=[42])
+    p.add_argument("--analysis",   nargs="+",
+                   choices=["cv", "loo", "all"], default=["all"],
+                   help="Which analyses to run")
+    return p.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+
+    print(f"Loading {args.input} ...")
+    df = pd.read_csv(args.input)
+    print(f"Loaded {len(df)} rows.")
+
+    lang_col = "tgt_lang" if args.mode == 1 else "src_lang"
+    run_all  = "all" in args.analysis
+
+    if run_all or "cv" in args.analysis:
+        run_cv(df, args.output_dir, args.n_splits, args.seeds, args.name)
+
+    if run_all or "loo" in args.analysis:
+        leave_one_out(df, args.output_dir, args.name,
+                      seed=args.seeds[0], lang_col=lang_col)
