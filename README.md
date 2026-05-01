@@ -1,7 +1,6 @@
-# Even Eigenvalues Know the Word Order
-### Probing Cross-Attention in Multilingual MT
+# Cross-Attention Eigenvalues Know the Word Order in Multilingual Machine Translation
 
-Code for the paper *"Even Eigenvalues Know the Word Order: Probing Cross-Attention in Multilingual MT"*.
+Code for the paper *"Cross-Attention Eigenvalues Know the Word Order in Multilingual Machine Translation"*.
 
 We probe the cross-attention mechanism of [NLLB-200](https://arxiv.org/abs/2207.04672) to investigate whether its geometry encodes target-language word order (SVO vs. SOV). Features are eigenvalues of per-layer-head Gram matrices; classification is done with a linear logistic regression probe.
 
