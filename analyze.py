@@ -7,6 +7,7 @@ from typing import Dict, List, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from joblib import Parallel, delayed
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score
 from sklearn.model_selection import StratifiedGroupKFold
@@ -56,18 +57,24 @@ def cv_accuracy(
     groups: np.ndarray,
     n_splits: int = 5,
     seeds: List[int] = (42,),
+    max_iter: int = 5000,
+    n_jobs: int = -1,
 ) -> Tuple[float, float]:
-    """Return (mean_accuracy, std_accuracy) over seeds × folds."""
-    accs = []
+    def _fit_fold(seed, train_idx, val_idx):
+        scaler = StandardScaler().fit(X[train_idx])
+        X_tr = scaler.transform(X[train_idx])
+        X_val = scaler.transform(X[val_idx])
+        clf = LogisticRegression(max_iter=max_iter, random_state=seed)
+        clf.fit(X_tr, y[train_idx])
+        return accuracy_score(y[val_idx], clf.predict(X_val))
+
+    tasks = []
     for seed in seeds:
         skf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
         for train_idx, val_idx in skf.split(X, y, groups=groups):
-            scaler = StandardScaler().fit(X[train_idx])
-            X_tr = scaler.transform(X[train_idx])
-            X_val = scaler.transform(X[val_idx])
-            clf = LogisticRegression(max_iter=1000, random_state=seed)
-            clf.fit(X_tr, y[train_idx])
-            accs.append(accuracy_score(y[val_idx], clf.predict(X_val)))
+            tasks.append(delayed(_fit_fold)(seed, train_idx, val_idx))
+
+    accs = Parallel(n_jobs=n_jobs)(tasks)
     arr = np.array(accs)
     return float(arr.mean()), float(arr.std(ddof=0))
 
@@ -201,18 +208,189 @@ def run_cv(
 
 
 # ---------------------------------------------------------------------------
+# Control task and selectivity
+# ---------------------------------------------------------------------------
+
+
+def make_control_labels(df: pd.DataFrame, seed: int) -> np.ndarray:
+    """Assign one random label per sentence ID."""
+    rng = np.random.RandomState(seed)
+    y = df["y"].to_numpy()
+    groups = df["sent_id"].to_numpy()
+    classes, counts = np.unique(y, return_counts=True)
+    probs = counts / counts.sum()
+
+    unique_groups = np.unique(groups)
+    labels = rng.choice(classes, size=len(unique_groups), p=probs)
+    group_to_label = dict(zip(unique_groups, labels))
+
+    return np.array([group_to_label[g] for g in groups])
+
+
+def run_control(
+    df: pd.DataFrame, output_dir: str, n_splits: int, seeds: List[int], name: str
+):
+    os.makedirs(output_dir, exist_ok=True)
+
+    y_control = make_control_labels(df, seed=seeds[0])
+    groups = df["sent_id"].to_numpy()
+    n_layers, n_heads = infer_dims(df)
+    print(f"Control task: {len(df)} samples, class balance: {np.bincount(y_control)}")
+
+    # Load real (non-control) results dumped earlier by run_cv
+    summary_path = os.path.join(output_dir, f"{name}_summary.json")
+    real_results = None
+    if os.path.exists(summary_path):
+        with open(summary_path) as f:
+            real_results = json.load(f)
+    else:
+        print(f"  Warning: {summary_path} not found, selectivity will not be computed")
+
+    control_results: Dict = {}
+
+    # 1. Full features
+    print("\n[1/4] Full features (control)")
+    X_full = df[
+        [c for c in df.columns if re.search(r"_l\d+_h\d+", c) or c.startswith("eig_")]
+    ].to_numpy(dtype=np.float32)
+    m, s = cv_accuracy(X_full, y_control, groups, n_splits, seeds)
+    control_results["full"] = {"mean": round(m, 4), "std": round(s, 4)}
+    print(f"  acc = {m:.4f} ± {s:.4f}")
+
+    # 2. Per-layer
+    print("\n[2/4] Per-layer (control)")
+    layer_accs = []
+    for l in range(n_layers):
+        cols = cols_layer(df, l)
+        m, s = cv_accuracy(
+            df[cols].to_numpy(dtype=np.float32), y_control, groups, n_splits, seeds
+        )
+        layer_accs.append((m, s))
+        print(f"  L{l:02d}: {m:.4f} ± {s:.4f}")
+    control_results["by_layer"] = [
+        {"layer": l, "mean": round(m, 4), "std": round(s, 4)}
+        for l, (m, s) in enumerate(layer_accs)
+    ]
+
+    # 3. Per-head
+    print("\n[3/4] Per-head (control)")
+    head_accs = []
+    for h in range(n_heads):
+        cols = cols_head(df, h)
+        m, s = cv_accuracy(
+            df[cols].to_numpy(dtype=np.float32), y_control, groups, n_splits, seeds
+        )
+        head_accs.append((m, s))
+        print(f"  H{h:02d}: {m:.4f} ± {s:.4f}")
+    control_results["by_head"] = [
+        {"head": h, "mean": round(m, 4), "std": round(s, 4)}
+        for h, (m, s) in enumerate(head_accs)
+    ]
+
+    # 4. Heatmap
+    print(
+        f"\n[4/4] Heatmap (control, {n_layers}×{n_heads} = {n_layers * n_heads} probes)"
+    )
+    heatmap = np.full((n_layers, n_heads), np.nan)
+    for l in range(n_layers):
+        for h in range(n_heads):
+            cols = cols_layer_head(df, l, h)
+            if not cols:
+                continue
+            m, _ = cv_accuracy(
+                df[cols].to_numpy(dtype=np.float32), y_control, groups, n_splits, seeds
+            )
+            heatmap[l, h] = m
+        print(f"  Layer {l:02d} done")
+    control_results["heatmap"] = heatmap.tolist()
+
+    control_name = f"{name}_control"
+    with open(os.path.join(output_dir, f"{control_name}_summary.json"), "w") as f:
+        json.dump(control_results, f, indent=2)
+
+    _plot_heatmap(heatmap, output_dir, control_name)
+    _plot_by_layer(layer_accs, output_dir, control_name)
+    _plot_by_head(head_accs, output_dir, control_name)
+
+    # Selectivity = real_acc - control_acc, computed everywhere real_results is available
+    if real_results is not None:
+        sel_full = round(
+            real_results["full"]["mean"] - control_results["full"]["mean"], 4
+        )
+        print(
+            f"\nSelectivity (full) = {real_results['full']['mean']:.4f} - {control_results['full']['mean']:.4f} = {sel_full:.4f}"
+        )
+
+        sel_by_layer = [
+            {
+                "layer": rl["layer"],
+                "real": rl["mean"],
+                "control": cl["mean"],
+                "selectivity": round(rl["mean"] - cl["mean"], 4),
+            }
+            for rl, cl in zip(real_results["by_layer"], control_results["by_layer"])
+        ]
+        sel_by_head = [
+            {
+                "head": rh["head"],
+                "real": rh["mean"],
+                "control": ch["mean"],
+                "selectivity": round(rh["mean"] - ch["mean"], 4),
+            }
+            for rh, ch in zip(real_results["by_head"], control_results["by_head"])
+        ]
+        sel_heatmap = np.array(real_results["heatmap"]) - heatmap
+
+        selectivity_results = {
+            "full": sel_full,
+            "by_layer": sel_by_layer,
+            "by_head": sel_by_head,
+            "heatmap": sel_heatmap.tolist(),
+        }
+        sel_name = f"{name}_selectivity"
+        with open(os.path.join(output_dir, f"{sel_name}_summary.json"), "w") as f:
+            json.dump(selectivity_results, f, indent=2)
+
+        _plot_heatmap(
+            sel_heatmap, output_dir, sel_name, vmin=-1.0, vmax=1.0, metric="Selectivity"
+        )
+        _plot_by_layer(
+            [(d["selectivity"], 0.0) for d in sel_by_layer],
+            output_dir,
+            sel_name,
+            metric="Selectivity",
+        )
+        _plot_by_head(
+            [(d["selectivity"], 0.0) for d in sel_by_head],
+            output_dir,
+            sel_name,
+            metric="Selectivity",
+        )
+        print(f"Saved selectivity results to {output_dir}/{sel_name}_*")
+
+    print(f"\nAll control outputs saved to {output_dir}/")
+
+
+# ---------------------------------------------------------------------------
 # Plots
 # ---------------------------------------------------------------------------
 
 
-def _plot_heatmap(heatmap: np.ndarray, output_dir: str, name: str):
+def _plot_heatmap(
+    heatmap: np.ndarray,
+    output_dir: str,
+    name: str,
+    vmin: float = 0.5,
+    vmax: float = 1.0,
+    metric: str = "Accuracy",
+):
     n_layers, n_heads = heatmap.shape
     fig, ax = plt.subplots(figsize=(max(8, n_heads * 0.6), max(6, n_layers * 0.4)))
-    im = ax.imshow(heatmap, aspect="auto", cmap="viridis", vmin=0.5, vmax=1.0)
-    plt.colorbar(im, ax=ax, label="Accuracy")
+    im = ax.imshow(heatmap, aspect="auto", cmap="viridis", vmin=vmin, vmax=vmax)
+    plt.colorbar(im, ax=ax, label=metric)
     ax.set_xlabel("Head", fontsize=12)
     ax.set_ylabel("Layer", fontsize=12)
-    ax.set_title("Probe Accuracy per (Layer, Head)", fontsize=13)
+    ax.set_title(f"Probe {metric} per (Layer, Head)", fontsize=13)
     ax.set_xticks(range(n_heads))
     ax.set_yticks(range(n_layers))
     ax.set_xticklabels(range(n_heads), fontsize=8)
@@ -228,19 +406,24 @@ def _plot_heatmap(heatmap: np.ndarray, output_dir: str, name: str):
                     ha="center",
                     va="center",
                     fontsize=6,
-                    color="white" if v < 0.8 else "black",
+                    color="white" if v < (vmin + vmax) / 2 else "black",
                 )
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, f"{name}_heatmap.png"), dpi=150)
     plt.close()
 
 
-def _plot_by_layer(layer_accs: List[Tuple[float, float]], output_dir: str, name: str):
+def _plot_by_layer(
+    layer_accs: List[Tuple[float, float]],
+    output_dir: str,
+    name: str,
+    metric: str = "Accuracy",
+):
     layers = list(range(len(layer_accs)))
     means = [m for m, _ in layer_accs]
     stds = [s for _, s in layer_accs]
     fig, ax = plt.subplots(figsize=(10, 4))
-    ax.plot(layers, means, marker="o", linewidth=1.5, color="#2c7bb6", label="Accuracy")
+    ax.plot(layers, means, marker="o", linewidth=1.5, color="#2c7bb6", label=metric)
     ax.fill_between(
         layers,
         [m - s for m, s in zip(means, stds)],
@@ -248,12 +431,18 @@ def _plot_by_layer(layer_accs: List[Tuple[float, float]], output_dir: str, name:
         alpha=0.2,
         color="#2c7bb6",
     )
-    ax.axhline(0.5, linestyle="--", color="gray", linewidth=1, label="Chance")
+    ax.axhline(
+        0.0 if metric == "Selectivity" else 0.5,
+        linestyle="--",
+        color="gray",
+        linewidth=1,
+        label="Zero" if metric == "Selectivity" else "Chance",
+    )
     ax.set_xlabel("Layer", fontsize=12)
-    ax.set_ylabel("Accuracy", fontsize=12)
-    ax.set_title("Probe Accuracy by Layer", fontsize=13)
+    ax.set_ylabel(metric, fontsize=12)
+    ax.set_title(f"Probe {metric} by Layer", fontsize=13)
     ax.set_xticks(layers)
-    ax.set_ylim(0.4, 1.05)
+    ax.set_ylim(-1.05 if metric == "Selectivity" else 0.4, 1.05)
     ax.legend()
     ax.grid(axis="y", alpha=0.3)
     plt.tight_layout()
@@ -261,12 +450,17 @@ def _plot_by_layer(layer_accs: List[Tuple[float, float]], output_dir: str, name:
     plt.close()
 
 
-def _plot_by_head(head_accs: List[Tuple[float, float]], output_dir: str, name: str):
+def _plot_by_head(
+    head_accs: List[Tuple[float, float]],
+    output_dir: str,
+    name: str,
+    metric: str = "Accuracy",
+):
     heads = list(range(len(head_accs)))
     means = [m for m, _ in head_accs]
     stds = [s for _, s in head_accs]
     fig, ax = plt.subplots(figsize=(10, 4))
-    ax.plot(heads, means, marker="o", linewidth=1.5, color="#2c7bb6", label="Accuracy")
+    ax.plot(heads, means, marker="o", linewidth=1.5, color="#2c7bb6", label=metric)
     ax.fill_between(
         heads,
         [m - s for m, s in zip(means, stds)],
@@ -274,12 +468,18 @@ def _plot_by_head(head_accs: List[Tuple[float, float]], output_dir: str, name: s
         alpha=0.2,
         color="#2c7bb6",
     )
-    ax.axhline(0.5, linestyle="--", color="gray", linewidth=1, label="Chance")
+    ax.axhline(
+        0.0 if metric == "Selectivity" else 0.5,
+        linestyle="--",
+        color="gray",
+        linewidth=1,
+        label="Zero" if metric == "Selectivity" else "Chance",
+    )
     ax.set_xlabel("Head", fontsize=12)
-    ax.set_ylabel("Accuracy", fontsize=12)
-    ax.set_title("Probe Accuracy by Head", fontsize=13)
+    ax.set_ylabel(metric, fontsize=12)
+    ax.set_title(f"Probe {metric} by Head", fontsize=13)
     ax.set_xticks(heads)
-    ax.set_ylim(0.4, 1.05)
+    ax.set_ylim(-1.05 if metric == "Selectivity" else 0.4, 1.05)
     ax.legend()
     ax.grid(axis="y", alpha=0.3)
     plt.tight_layout()
@@ -367,7 +567,7 @@ def leave_one_out(
 # ---------------------------------------------------------------------------
 
 
-def parse_args():
+def parse_args(argv=None):
     p = argparse.ArgumentParser(
         description="Run probing analysis on eigenvalue features."
     )
@@ -392,9 +592,9 @@ def parse_args():
     p.add_argument(
         "--analysis",
         nargs="+",
-        choices=["cv", "loo", "all"],
+        choices=["cv", "loo", "control", "all"],
         default=["all"],
-        help="Which analyses to run",
+        help="Which analyses to run; all runs CV, control/selectivity, then LOO",
     )
     p.add_argument(
         "--topk",
@@ -402,11 +602,11 @@ def parse_args():
         default=12,
         help="Use only top-k eigenvalues (0..topk-1). Ignored for baseline features.",
     )
-    return p.parse_args()
+    return p.parse_args(argv)
 
 
-if __name__ == "__main__":
-    args = parse_args()
+def main(argv=None):
+    args = parse_args(argv)
 
     print(f"Loading {args.input} ...")
     df = pd.read_csv(args.input)
@@ -415,13 +615,22 @@ if __name__ == "__main__":
     lang_col = "tgt_lang" if args.mode == 1 else "src_lang"
     run_all = "all" in args.analysis
 
+    filtered = filter_topk(df, args.topk)
+    if len(filtered.columns) != len(df.columns):
+        print(f"Using top-{args.topk} eigenvalues per (layer, head)")
+    df = filtered
+
     if run_all or "cv" in args.analysis:
-        if args.topk < 12:
-            df = filter_topk(df, args.topk)
-            print(f"Using top-{args.topk} eigenvalues per (layer, head)")
         run_cv(df, args.output_dir, args.n_splits, args.seeds, args.name)
+
+    if run_all or "control" in args.analysis:
+        run_control(df, args.output_dir, args.n_splits, args.seeds, args.name)
 
     if run_all or "loo" in args.analysis:
         leave_one_out(
             df, args.output_dir, args.name, seed=args.seeds[0], lang_col=lang_col
         )
+
+
+if __name__ == "__main__":
+    main()

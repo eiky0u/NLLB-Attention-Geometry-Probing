@@ -1,7 +1,7 @@
 import argparse
 import os
 import re
-from typing import Dict, List, Optional, Tuple, Callable
+from typing import Callable, Dict, Optional
 
 import numpy as np
 import pandas as pd

@@ -1,24 +1,26 @@
 # Cross-Attention Eigenvalues Know the Word Order in Multilingual Machine Translation
 
-Code for the paper *"Cross-Attention Eigenvalues Know the Word Order in Multilingual Machine Translation"*.
+This repository contains the code for the paper "Cross-Attention Eigenvalues Know the Word Order in Multilingual Machine Translation", accepted to the main conference of EMNLP 2026.
 
 We probe the cross-attention mechanism of [NLLB-200](https://arxiv.org/abs/2207.04672) to investigate whether its geometry encodes target-language word order (SVO vs. SOV). Features are eigenvalues of per-layer-head Gram matrices; classification is done with a linear logistic regression probe.
 
 ---
 
-## Requirements
+## Installation
+
+Install the dependencies in a virtual environment:
 
 ```bash
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
-Models are downloaded automatically from Hugging Face on first run. The FLORES-200 dataset is downloaded automatically as well.
+Models and FLORES-200 are downloaded if they are not already available.
 
 ---
 
 ## Pipeline
 
-The pipeline consists of three scripts that must be run in order.
+Follow Steps 1-3 for the main pipeline. Step 4 contains optional controls and baselines.
 
 ### Step 1 — Dump cross-attention maps
 
@@ -90,7 +92,10 @@ python analyze.py \
     --input ./outputs/mode1_600M.csv \
     --output_dir ./outputs/results \
     --name mode1_600M \
-    --mode 1
+    --mode 1 \
+    --analysis cv loo \
+    --n_splits 5 \
+    --seeds 42 1 2
 ```
 
 | Argument | Default | Description |
@@ -100,18 +105,68 @@ python analyze.py \
 | `--name` | required | Prefix for output files |
 | `--mode` | `1` | `1` = eng→X, `2` = X→eng |
 | `--n_splits` | `5` | Number of CV folds |
-| `--seeds` | `42` | One or more random seeds (space-separated) |
-| `--analysis` | `all` | Analyses to run: `cv`, `loo`, or `all` |
+| `--seeds` | `42` | Use `42 1 2` for three-seed CV; LOO uses the first seed |
+| `--analysis` | `all` | `cv`, `loo`, `control`, or `all` (CV, control/selectivity, then LOO); multiple values allowed |
+| `--topk` | `12` | Number of eigenvalue features to use per layer-head pair |
 
 Output files:
 ```
-results/
+outputs/results/
   mode1_600M_summary.json   # CV accuracy: full, per-layer, per-head, heatmap
   mode1_600M_heatmap.png
   mode1_600M_by_layer.png
   mode1_600M_by_head.png
-  mode1_600M_loo.csv            # LOO per-language accuracy
-  mode1_600M_loo.json           # LOO summary
+  mode1_600Mloo.csv        # LOO per-language accuracy
+  mode1_600Mloo.json       # LOO summary
 ```
 
 ---
+
+### Step 4 (Optional) — Controls and baselines
+
+#### Controls
+
+Runs control tasks with randomly assigned word-order labels, shared across all language versions of each sentence.
+
+```bash
+python analyze.py \
+    --input ./outputs/mode1_600M.csv \
+    --output_dir ./outputs/results \
+    --name mode1_600M \
+    --mode 1 \
+    --analysis control \
+    --n_splits 5 \
+    --seeds 42 1 2
+```
+
+For another model, use its feature CSV and the same output directory and name as
+its Step 3 analysis. For X-to-English, use the mode 2 CSV and pass `--mode 2`.
+
+The commands save `<name>_control_summary.json` and control plots. If the matching
+`<name>_summary.json` exists in the output directory, they also save
+`<name>_selectivity_*` files.
+
+#### Baselines
+
+Use `--features` to extract `entropy`, `confidence`, `coverage`, or `variance`
+instead of eigenvalues. For example, to use entropy:
+
+```bash
+python build_dataset.py \
+    --attn_root ./outputs/nllb-200-distilled-600M/attentions \
+    --output ./outputs/entropy_mode1_600M.csv \
+    --mode 1 \
+    --features entropy
+
+python analyze.py \
+    --input ./outputs/entropy_mode1_600M.csv \
+    --output_dir ./outputs/results \
+    --name entropy_mode1_600M \
+    --mode 1 \
+    --analysis cv loo \
+    --n_splits 5 \
+    --seeds 42 1 2
+```
+
+Repeat for the other features, using a separate CSV and output name for each.
+For X-to-English, pass `--mode 2` to both scripts and use separate output names.

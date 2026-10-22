@@ -1,20 +1,20 @@
+import argparse
 import os
 import tarfile
 import urllib.request
-import argparse
 from typing import List
 
-from tqdm.auto import tqdm
 import pandas as pd
 import torch
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+from tqdm.auto import tqdm
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
 ENG_CODE = "eng_Latn"
 
 AVAILABLE_MODELS = {
-    "600M":  "facebook/nllb-200-distilled-600M",
-    "1.3B":  "facebook/nllb-200-distilled-1.3B",
-    "3.3B":  "facebook/nllb-200-3.3B",
+    "600M": "facebook/nllb-200-distilled-600M",
+    "1.3B": "facebook/nllb-200-distilled-1.3B",
+    "3.3B": "facebook/nllb-200-3.3B",
 }
 
 OTHER_LANGS: List[str] = [
@@ -91,7 +91,7 @@ def dump_attentions_all_pairs(
 ):
     model_slug = model_name.split("/")[-1]
     output_dir = os.path.join(output_dir, model_slug)
-    attn_root  = os.path.join(output_dir, "attentions")
+    attn_root = os.path.join(output_dir, "attentions")
     trans_root = os.path.join(output_dir, "translations")
 
     os.makedirs(attn_root, exist_ok=True)
@@ -114,8 +114,8 @@ def dump_attentions_all_pairs(
         if limit_sentences:
             src_df = src_df.head(limit_sentences)
 
-        texts  = src_df["text"].tolist()
-        ids    = src_df["id"].tolist()
+        texts = src_df["text"].tolist()
+        ids = src_df["id"].tolist()
         n_sent = len(ids)
 
         for tgt_lang in LANG_CODES:
@@ -124,9 +124,9 @@ def dump_attentions_all_pairs(
             if not (is_eng_to_other or is_other_to_eng):
                 continue
 
-            attn_pair_dir  = os.path.join(attn_root,  f"{src_lang}-{tgt_lang}")
+            attn_pair_dir = os.path.join(attn_root, f"{src_lang}-{tgt_lang}")
             trans_pair_dir = os.path.join(trans_root, f"{src_lang}-{tgt_lang}")
-            os.makedirs(attn_pair_dir,  exist_ok=True)
+            os.makedirs(attn_pair_dir, exist_ok=True)
             os.makedirs(trans_pair_dir, exist_ok=True)
 
             tokenizer.src_lang = src_lang
@@ -134,19 +134,30 @@ def dump_attentions_all_pairs(
 
             print(f"Translating & dumping {src_lang}->{tgt_lang}")
 
-            for idx in tqdm(range(n_sent), desc=f"{src_lang}->{tgt_lang}",
-                            dynamic_ncols=True, leave=False):
+            for idx in tqdm(
+                range(n_sent),
+                desc=f"{src_lang}->{tgt_lang}",
+                dynamic_ncols=True,
+                leave=False,
+            ):
                 sent_id = ids[idx]
-                text    = texts[idx]
+                text = texts[idx]
 
-                attn_path  = os.path.join(attn_pair_dir,  f"{src_lang}-{tgt_lang}-{sent_id}.pt")
-                trans_path = os.path.join(trans_pair_dir, f"{src_lang}-{tgt_lang}-{sent_id}.txt")
+                attn_path = os.path.join(
+                    attn_pair_dir, f"{src_lang}-{tgt_lang}-{sent_id}.pt"
+                )
+                trans_path = os.path.join(
+                    trans_pair_dir, f"{src_lang}-{tgt_lang}-{sent_id}.txt"
+                )
 
                 if os.path.exists(attn_path) and os.path.exists(trans_path):
                     continue
 
                 inputs = tokenizer(
-                    text, return_tensors="pt", padding=True, truncation=True,
+                    text,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
                 ).to(device)
 
                 with torch.no_grad():
@@ -161,16 +172,17 @@ def dump_attentions_all_pairs(
                     )
 
                 translation_text = tokenizer.decode(
-                    gen_out.sequences[0], skip_special_tokens=True,
+                    gen_out.sequences[0],
+                    skip_special_tokens=True,
                 )
                 with open(trans_path, "w", encoding="utf-8") as f:
                     f.write(translation_text)
 
-                beam_indices  = gen_out.beam_indices
-                cross_att     = gen_out.cross_attentions
+                beam_indices = gen_out.beam_indices
+                cross_att = gen_out.cross_attentions
                 num_steps_gen = len(cross_att)
-                num_layers    = len(cross_att[0])
-                steps_to_use  = min(num_steps_gen, beam_indices.shape[1])
+                num_layers = len(cross_att[0])
+                steps_to_use = min(num_steps_gen, beam_indices.shape[1])
 
                 if steps_to_use == 0:
                     del gen_out, beam_indices, cross_att
@@ -213,12 +225,16 @@ def parse_args():
         choices=list(AVAILABLE_MODELS.keys()),
         help=f"Model size. One of: {list(AVAILABLE_MODELS.keys())}. Default: 600M",
     )
-    parser.add_argument("--root_dir",   type=str, default="./data")
-    parser.add_argument("--out_dir",    type=str, default="./outputs")
-    parser.add_argument("--num_beams",  type=int, default=4)
+    parser.add_argument("--root_dir", type=str, default="./data")
+    parser.add_argument("--out_dir", type=str, default="./outputs")
+    parser.add_argument("--num_beams", type=int, default=4)
     parser.add_argument("--max_length", type=int, default=256)
-    parser.add_argument("--limit",      type=int, default=None,
-                        help="Limit sentences per language for testing.")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Limit sentences per language for testing.",
+    )
     return parser.parse_args()
 
 
